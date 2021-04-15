@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -13,7 +14,8 @@ import (
 	"strings"
 	"time"
 
-	machinev1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
+	"github.com/openshift/cluster-machine-approver/pkg/machinehandler"
+	machinehandlerpkg "github.com/openshift/cluster-machine-approver/pkg/machinehandler"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -129,7 +131,7 @@ func validateCSRContents(req *certificatesv1.CertificateSigningRequest, csr *x50
 func authorizeCSR(
 	c client.Client,
 	config ClusterMachineApproverConfig,
-	machines []machinev1.Machine,
+	machineHandler machinehandler.MachineHandler,
 	req *certificatesv1.CertificateSigningRequest,
 	csr *x509.CertificateRequest,
 	ca *x509.CertPool,
@@ -144,7 +146,7 @@ func authorizeCSR(
 			klog.Errorf("%v: CSR rejected as the flow is disabled", req.Name)
 			return false, fmt.Errorf("CSR %s for node client cert rejected as the flow is disabled", req.Name)
 		}
-		return authorizeNodeClientCSR(c, machines, req, csr)
+		return authorizeNodeClientCSR(c, machineHandler, req, csr)
 	}
 
 	klog.Infof("%v: CSR does not appear to be client csr", req.Name)
@@ -191,10 +193,16 @@ func authorizeCSR(
 	klog.Infof("Falling back to machine-api authorization for %s", nodeAsking)
 
 	// Check that we have a registered node with the request name
-	targetMachine, ok := findMatchingMachineFromNodeRef(nodeAsking, machines)
-	if !ok {
+	targetMachine, err := machineHandler.FindMatchingMachineFromNodeRef(nodeAsking)
+	if err != nil {
 		klog.Errorf("%v: Serving Cert: No target machine for node %q", req.Name, nodeAsking)
 		//TODO: set annotation/emit event here.
+		return false, nil
+	}
+
+	machineAddresses, err := machineHandler.GetMachineAddresses(*targetMachine)
+	if err != nil {
+		klog.Errorf("%v: unable to get machine addresses for node %q", req.Name, nodeAsking)
 		return false, nil
 	}
 
@@ -207,8 +215,8 @@ func authorizeCSR(
 		}
 		var attemptedAddresses []string
 		var foundSan bool
-		for _, addr := range targetMachine.Status.Addresses {
-			switch addr.Type {
+		for _, addr := range machineAddresses {
+			switch corev1.NodeAddressType(addr.Type) {
 			case corev1.NodeInternalDNS, corev1.NodeExternalDNS, corev1.NodeHostName:
 				if san == addr.Address {
 					foundSan = true
@@ -235,8 +243,8 @@ func authorizeCSR(
 		}
 		var attemptedAddresses []string
 		var foundSan bool
-		for _, addr := range targetMachine.Status.Addresses {
-			switch addr.Type {
+		for _, addr := range machineAddresses {
+			switch corev1.NodeAddressType(addr.Type) {
 			case corev1.NodeInternalIP, corev1.NodeExternalIP:
 				if san.String() == addr.Address {
 					foundSan = true
@@ -260,7 +268,7 @@ func authorizeCSR(
 	return true, nil
 }
 
-func authorizeNodeClientCSR(c client.Client, machines []machinev1.Machine, req *certificatesv1.CertificateSigningRequest, csr *x509.CertificateRequest) (bool, error) {
+func authorizeNodeClientCSR(c client.Client, machineHandler machinehandler.MachineHandler, req *certificatesv1.CertificateSigningRequest, csr *x509.CertificateRequest) (bool, error) {
 
 	if !isReqFromNodeBootstrapper(req) {
 		klog.Infof("%v: CSR does not appear to be a valid node bootstrapper client cert request", req.Name)
@@ -284,21 +292,33 @@ func authorizeNodeClientCSR(c client.Client, machines []machinev1.Machine, req *
 		return false, nil
 	}
 
-	nodeMachine, ok := findMatchingMachineFromInternalDNS(nodeName, machines)
-	if !ok {
+	nodeMachine, err := machineHandler.FindMatchingMachineFromInternalDNS(nodeName)
+	if err != nil {
 		//TODO: set annotation/emit event here.
 		klog.Errorf("%v: failed to find machine for node %s, cannot approve", req.Name, nodeName)
 		return false, fmt.Errorf("failed to find machine for node %s", nodeName)
 	}
 
-	if nodeMachine.Status.NodeRef != nil {
+	nodeRef, err := machineHandler.GetMachineNodeRef(nodeMachine)
+	if err != nil && !errors.Is(err, machinehandlerpkg.ErrUnstructuredFieldNotFound) {
+		klog.Errorf("%v: failed to get machine's noderef for node: %v", req.Name, nodeName, err)
+		return false, fmt.Errorf("failed to get machine's noderef for node %s: %v", nodeName, err)
+	}
+
+	if nodeRef != nil {
 		//TODO: set annotation/emit event here.
-		klog.Errorf("%v: machine for node %s already has node ref, cannot approve", req.Name, nodeName)
+		klog.Errorf("%v: machine for node %v already has node ref, cannot approve", nodeRef)
 		return false, nil
 	}
 
-	start := nodeMachine.CreationTimestamp.Add(-maxMachineClockSkew)
-	end := nodeMachine.CreationTimestamp.Add(maxMachineDelta)
+	machineCreationTimestamp, err := machineHandler.GetMachineCreationTimestamp(nodeMachine)
+	if err != nil {
+		klog.Errorf("%v: failed to get creation timestamp  machine for node %s, cannot approve", req.Name, nodeName)
+		return false, fmt.Errorf("failed to find machine for node %s", nodeName)
+	}
+
+	start := machineCreationTimestamp.Add(-maxMachineClockSkew)
+	end := machineCreationTimestamp.Add(maxMachineDelta)
 	if !inTimeSpan(start, end, req.CreationTimestamp.Time) {
 		//TODO: set annotation/emit event here.
 		klog.Errorf("%v: CSR creation time %s not in range (%s, %s)", req.Name, req.CreationTimestamp.Time, start, end)
@@ -351,26 +371,6 @@ func authorizeServingRenewal(nodeName string, csr *x509.CertificateRequest, curr
 
 func isReqFromNodeBootstrapper(req *certificatesv1.CertificateSigningRequest) bool {
 	return req.Spec.Username == nodeBootstrapperUsername && nodeBootstrapperGroups.Equal(sets.NewString(req.Spec.Groups...))
-}
-
-func findMatchingMachineFromNodeRef(nodeName string, machines []machinev1.Machine) (machinev1.Machine, bool) {
-	for _, machine := range machines {
-		if machine.Status.NodeRef != nil && machine.Status.NodeRef.Name == nodeName {
-			return machine, true
-		}
-	}
-	return machinev1.Machine{}, false
-}
-
-func findMatchingMachineFromInternalDNS(nodeName string, machines []machinev1.Machine) (machinev1.Machine, bool) {
-	for _, machine := range machines {
-		for _, address := range machine.Status.Addresses {
-			if address.Type == corev1.NodeInternalDNS && address.Address == nodeName {
-				return machine, true
-			}
-		}
-	}
-	return machinev1.Machine{}, false
 }
 
 func inTimeSpan(start, end, check time.Time) bool {
