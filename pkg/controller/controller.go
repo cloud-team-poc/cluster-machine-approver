@@ -7,16 +7,15 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	machinev1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
+	"github.com/openshift/cluster-machine-approver/pkg/machinehandler"
 	certificatesv1 "k8s.io/api/certificates/v1"
-	certificatesv1client "k8s.io/client-go/kubernetes/typed/certificates/v1"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	certificatesv1client "k8s.io/client-go/kubernetes/typed/certificates/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
-
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,8 +35,9 @@ const (
 // MachineApproverReconciler reconciles a machine-approver  object
 type CertificateApprover struct {
 	client.Client
-	RestCfg *rest.Config
-	Config  ClusterMachineApproverConfig
+	RestCfg  *rest.Config
+	Config   ClusterMachineApproverConfig
+	APIGroup string
 }
 
 func (m *CertificateApprover) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
@@ -117,20 +117,25 @@ func (m *CertificateApprover) Reconcile(ctx context.Context, req ctrl.Request) (
 		return reconcile.Result{}, fmt.Errorf("Failed to get CSRs: %w", err)
 	}
 
-	machines := &machinev1.MachineList{}
-	if err := m.List(ctx, machines); err != nil {
+	machineHandler := &machinehandler.MachineHandler{
+		Client:   m.Client,
+		Config:   m.RestCfg,
+		Ctx:      ctx,
+		APIGroup: m.APIGroup,
+	}
+	if err := machineHandler.ListMachines(); err != nil {
 		klog.Errorf("%v: Failed to list machines: %v", req.Name, err)
 		return reconcile.Result{}, fmt.Errorf("Failed to list machines: %w", err)
 	}
 
-	if offLimits := reconcileLimits(req.Name, machines, csrs); offLimits {
+	if offLimits := reconcileLimits(req.Name, machineHandler.GetMachines(), csrs); offLimits {
 		// Stop all reconciliation
 		return reconcile.Result{}, nil
 	}
 
 	for _, csr := range csrs.Items {
 		if csr.Name == req.Name {
-			return reconcile.Result{}, m.reconcileCSR(csr, machines)
+			return reconcile.Result{}, m.reconcileCSR(csr, *machineHandler)
 		}
 	}
 
@@ -140,8 +145,8 @@ func (m *CertificateApprover) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // reconcileLimits will short circut logic if number of pending CSRs is exceeding limit
-func reconcileLimits(csrName string, machines *machinev1.MachineList, csrs *certificatesv1.CertificateSigningRequestList) bool {
-	maxPending := getMaxPending(machines.Items)
+func reconcileLimits(csrName string, machines []unstructured.Unstructured, csrs *certificatesv1.CertificateSigningRequestList) bool {
+	maxPending := getMaxPending(machines)
 	atomic.StoreUint32(&MaxPendingCSRs, uint32(maxPending))
 	pending := recentlyPendingCSRs(csrs.Items)
 	atomic.StoreUint32(&PendingCSRs, uint32(pending))
@@ -153,7 +158,7 @@ func reconcileLimits(csrName string, machines *machinev1.MachineList, csrs *cert
 	return false
 }
 
-func (m *CertificateApprover) reconcileCSR(csr certificatesv1.CertificateSigningRequest, machines *machinev1.MachineList) error {
+func (m *CertificateApprover) reconcileCSR(csr certificatesv1.CertificateSigningRequest, machineHandler machinehandler.MachineHandler) error {
 	parsedCSR, err := parseCSR(&csr)
 	if err != nil {
 		klog.Errorf("%v: Failed to parse csr: %v", csr.Name, err)
@@ -167,7 +172,7 @@ func (m *CertificateApprover) reconcileCSR(csr certificatesv1.CertificateSigning
 		klog.Errorf("failed to get kubelet CA")
 	}
 
-	if authorize, err := authorizeCSR(m, m.Config, machines.Items, &csr, parsedCSR, kubeletCA); !authorize {
+	if authorize, err := authorizeCSR(m, m.Config, machineHandler, &csr, parsedCSR, kubeletCA); !authorize {
 		// Don't deny since it might be someone else's CSR
 		klog.Infof("%s: CSR not authorized", csr.Name)
 		return err
@@ -239,6 +244,6 @@ func parseCSR(obj *certificatesv1.CertificateSigningRequest) (*x509.CertificateR
 	return x509.ParseCertificateRequest(block.Bytes)
 }
 
-func getMaxPending(machines []machinev1.Machine) int {
+func getMaxPending(machines []unstructured.Unstructured) int {
 	return len(machines) + maxDiffBetweenPendingCSRsAndMachinesCount
 }
